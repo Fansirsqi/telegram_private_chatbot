@@ -58,6 +58,17 @@ Version 4.0 removes all unstable external API dependencies, focusing on **extrem
 | `/reset` | **Reset Verification**<br>Forcibly clears the user's verification status; re-verification required next time. | Testing verification flow, or suspected account compromise. |
 | `/info` | **View Info**<br>Displays the current user's UID, Topic ID, and profile link. | Checking user details. |
 | `/cleanup` | **Batch Cleanup**<br>Scans and cleans up data for users whose topics have been deleted. | Clearing stale users. |
+| `/cleanupall` | **Force Delete All Tracked Topics**<br>After confirmation, permanently deletes all tracked user/anomaly topics and their messages, then removes mappings. | Bulk decluttering; irreversible. |
+
+### Force cleanup
+
+Send `/cleanupall` in any administrator-group topic (including General). The bot posts a warning and a confirmation code in **General**. The **same administrator** must send `/cleanupall confirm <code>` within **60 seconds**. Without confirmation, nothing is deleted. `/cleanupall@bot_username` is also supported. Cleanup runs in resumable batches to respect Worker execution limits. When prompted in General, the original administrator repeats `/cleanupall continue <code>` until completion; `/cleanupall` retrieves a pending continuation code. The final summary appears in General; failed records are retained for retry.
+
+- **Irreversible:** all messages inside deleted topics are removed. The bot needs **Delete Messages (`can_delete_messages`)** permission.
+- General, verification/trust status, and bans are preserved. New incoming messages recreate user topics automatically.
+- Telegram Bot API cannot enumerate every forum topic. Only KV-tracked topics (including orphan topics found via reverse mappings) can be deleted; untracked manually created topics require manual deletion.
+- Shares a best-effort KV lock with `/cleanup`, plus same-instance exclusion. This is not an atomic cross-instance lock. Run during low traffic: topics created during cleanup may fall outside its scan.
+- `/cleanup` remains non-destructive: it only removes stale user records.
 
 ---
 

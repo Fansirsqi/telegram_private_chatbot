@@ -19,6 +19,7 @@ const CONFIG = {
   CLEANUP_BATCH_SIZE: 10,
   MAX_CLEANUP_DISPLAY: 20,
   CLEANUP_LOCK_TTL_SECONDS: 1800, // /cleanup 防并发锁 30 分钟
+  CLEANUP_CONFIRM_TTL_SECONDS: 60, // 强制清理确认码有效期 1 分钟
   MAX_RETRY_ATTEMPTS: 3,
   THREAD_HEALTH_TTL_MS: 60000,
   // ---- Turnstile 人机验证 ----
@@ -39,6 +40,8 @@ const topicCreateInFlight = new Map();
 const adminStatusCache = new Map();
 // 【疑似异常信息】话题在 KV 中的 key（全局唯一，非 per-user）
 const ANOMALY_TOPIC_KEY = "anomaly_topic";
+// KV 锁不是原子锁；额外保护同一 Worker 实例内的清理任务。
+let cleanupInProgress = 0;
 
 // --- 本地题库 (15条) ---
 const LOCAL_QUESTIONS = [
@@ -427,6 +430,14 @@ async function resetUserVerificationAndRequireReverify(
   env,
   { userId, userKey, oldThreadId, pendingMsgId, reason },
 ) {
+  // 主动清理的话题不应被健康检查误判为验证失效（包括持有旧记录的并发请求）。
+  if (oldThreadId && await env.TOPIC_MAP.get(`cleanup:deleted:${oldThreadId}`)) {
+    await tgCall(env, "sendMessage", {
+      chat_id: userId,
+      text: "🧹 管理员正在整理话题，请稍后重新发送消息。你的验证状态保持不变。",
+    });
+    return;
+  }
   // 清理旧映射与验证状态：用户需要重新做人机验证
   await env.TOPIC_MAP.delete(`verified:${userId}`);
   await env.TOPIC_MAP.put(`needs_verify:${userId}`, "1", {
@@ -1052,7 +1063,7 @@ async function forwardToTopic(msg, userId, key, env, ctx) {
 /**
  * 管理员在群组话题内发起的指令与回信处理：
  * - 仅管理员可操作，先反查话题对应的 userId
- * - 处理 /help /cleanup /close /open /reset /trust /ban /unban /info 指令
+ * - 处理 /help /cleanup /cleanupall /close /open /reset /trust /ban /unban /info 指令
  * - 非指令消息则转发（回信）给对应用户
  */
 async function handleAdminReply(msg, env, ctx) {
@@ -1073,6 +1084,7 @@ async function handleAdminReply(msg, env, ctx) {
       "🛠️ **通用**",
       "• `/help` — 显示本帮助信息",
       "• `/cleanup` — 扫描并清理已失效的用户话题记录",
+      "• `/cleanupall` — 二次确认后删除全部已记录话题及消息（不可恢复，保留 General）",
       "",
       "💬 **话题管理**（进入对应用户话题后使用）",
       "• `/info` — 查看当前用户的信息与状态",
@@ -1098,6 +1110,12 @@ async function handleAdminReply(msg, env, ctx) {
   if (text === "/cleanup") {
     // /cleanup 可能处理较久，使用 waitUntil 防止 webhook 请求超时导致“卡住”
     ctx.waitUntil(handleCleanupCommand(threadId, env));
+    return;
+  }
+
+  // 危险指令必须在用户反查前拦截，任何参数错误也不能转发给用户。
+  if (/^\/cleanupall(?:@\w+)?(?:\s|$)/i.test(text)) {
+    await handleCleanupAllRequest(msg, env, ctx);
     return;
   }
 
@@ -2129,6 +2147,197 @@ function filterMessage(msg) {
 
 // ---------------- 辅助函数 ----------------
 
+// 同实例内互斥 + KV 尽力跨实例互斥（KV 不提供原子锁）。
+async function acquireCleanupLock(env, ttl = CONFIG.CLEANUP_LOCK_TTL_SECONDS) {
+  if (cleanupInProgress > Date.now()) return false;
+  cleanupInProgress = Date.now() + ttl * 1000;
+  try {
+    if (await env.TOPIC_MAP.get("cleanup:lock")) {
+      cleanupInProgress = 0;
+      return false;
+    }
+    await env.TOPIC_MAP.put("cleanup:lock", "1", {
+      expirationTtl: ttl,
+    });
+    return true;
+  } catch (e) {
+    cleanupInProgress = 0;
+    throw e;
+  }
+}
+
+async function releaseCleanupLock(env) {
+  try {
+    await env.TOPIC_MAP.delete("cleanup:lock");
+  } finally {
+    cleanupInProgress = 0;
+  }
+}
+
+async function handleCleanupAllRequest(msg, env, ctx) {
+  const recipient = msg.text.trim().split(/\s+/)[0].split("@")[1];
+  if (recipient) {
+    const me = await tgCall(env, "getMe", {});
+    if (!me.ok || me.result?.username?.toLowerCase() !== recipient.toLowerCase()) return;
+  }
+  const args = msg.text.trim().split(/\s+/).slice(1);
+  const key = `cleanup:confirm:${msg.from.id}`;
+  // 提示和报告发往 General，避免执行命令的话题被删除后无法反馈。
+  const notify = (text) => tgCall(env, "sendMessage", {
+    chat_id: env.SUPERGROUP_ID,
+    text,
+  });
+  if (args.length === 0) {
+    const active = await safeGetJSON(env, "cleanupall:job", null);
+    if (active) {
+      await notify(String(active.owner) === String(msg.from.id)
+        ? `⏸️ 你有未完成的清理任务。请继续：\n/cleanupall continue ${active.token}`
+        : "⏳ 有未完成的强制清理任务，请原管理员继续完成。");
+      return;
+    }
+    const token = secureRandomId(8);
+    await env.TOPIC_MAP.put(key, JSON.stringify({
+      token,
+      expires_at: Date.now() + CONFIG.CLEANUP_CONFIRM_TTL_SECONDS * 1000,
+    }), { expirationTtl: CONFIG.CLEANUP_CONFIRM_TTL_SECONDS });
+    await notify(
+      "⚠️ 强制清理将永久删除机器人已记录的全部用户话题、疑似异常信息话题及其中所有消息，不可恢复！\n" +
+      "保留 General；未记录的手动话题无法自动枚举。保留用户验证、永久信任和封禁状态，下次来信自动创建新话题。\n" +
+      "机器人须有删除消息权限。建议在低流量时执行；清理期间新建的话题可能不在本次范围内。\n\n" +
+      `如确认，请由你本人在 ${CONFIG.CLEANUP_CONFIRM_TTL_SECONDS} 秒内发送：\n/cleanupall confirm ${token}`,
+    );
+    return;
+  }
+  if (args.length === 2 && args[0] === "continue") {
+    const job = await safeGetJSON(env, "cleanupall:job", null);
+    if (!job || String(job.owner) !== String(msg.from.id) || job.token !== args[1]) {
+      await notify("❌ 没有可继续的清理任务，或继续码不属于你。");
+      return;
+    }
+    ctx.waitUntil(handleCleanupAllCommand(env, msg.from.id, args[1], true));
+    return;
+  }
+  const confirmation = await safeGetJSON(env, key, null);
+  if (args.length !== 2 || args[0] !== "confirm" ||
+      !confirmation || args[1] !== confirmation.token ||
+      !(confirmation.expires_at > Date.now())) {
+    await notify("❌ 确认无效或已过期。请重新发送 /cleanupall 获取确认码；不会删除任何话题。");
+    return;
+  }
+  await env.TOPIC_MAP.delete(key);
+  ctx.waitUntil(handleCleanupAllCommand(env, msg.from.id, confirmation.token));
+}
+
+async function handleCleanupAllCommand(env, owner, token, resume = false) {
+  const notify = async (text) => {
+    const res = await tgCall(env, "sendMessage", { chat_id: env.SUPERGROUP_ID, text }, 3000);
+    if (!res.ok) Logger.warn("cleanupall_notification_failed", { description: res.description });
+  };
+  // 每批只运行约 12 秒；即使 Worker 意外终止，锁也会在 60 秒后释放。
+  if (!(await acquireCleanupLock(env, 60))) {
+    await notify("⏳ 已有清理任务正在运行，请稍后重试。");
+    return;
+  }
+  const jobKey = "cleanupall:job";
+  let lastSave = Date.now();
+  const save = async (job) => {
+    // Workers KV 对同一个 key 限制每秒写入一次。
+    const wait = 1100 - (Date.now() - lastSave);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    await env.TOPIC_MAP.put(jobKey, JSON.stringify(job));
+    lastSave = Date.now();
+  };
+  const started = Date.now();
+  try {
+    let job = await safeGetJSON(env, jobKey, null);
+    if (job && (String(job.owner) !== String(owner) || job.token !== token)) {
+      await notify("⏳ 有未完成的强制清理任务，请原管理员使用之前的继续码完成。");
+      return;
+    }
+    if (!job) {
+      if (resume) {
+        await notify("❌ 清理任务已结束，无需继续。");
+        return;
+      }
+      job = { owner, token, phase: "user:", cursor: null, pending: [],
+        deleted: 0, missing: 0, errors: 0, skipped: 0 };
+      await save(job);
+    }
+    while (Date.now() - started < 12000) {
+      if (!job.pending.length) {
+        if (job.phase === "done") break;
+        if (job.phase === ANOMALY_TOPIC_KEY) {
+          const rec = await safeGetJSON(env, ANOMALY_TOPIC_KEY, null);
+          if (rec) job.pending = [{ key: ANOMALY_TOPIC_KEY, id: rec.thread_id }];
+          job.phase = "done";
+        } else {
+          const result = await env.TOPIC_MAP.list({
+            prefix: job.phase, cursor: job.cursor || undefined, limit: 20,
+          });
+          // 分页结果先持久化，再执行删除；中断后保留未完成的条目。
+          job.pending = result.keys.map(({ name }) => ({ key: name }));
+          if (result.list_complete) {
+            job.phase = job.phase === "user:" ? "thread:" : ANOMALY_TOPIC_KEY;
+            job.cursor = null;
+          } else {
+            job.cursor = result.cursor;
+          }
+        }
+        await save(job);
+        continue;
+      }
+      const item = job.pending[0];
+      let threadId;
+      try {
+        const rec = item.key.startsWith("user:") || item.key === ANOMALY_TOPIC_KEY
+          ? await safeGetJSON(env, item.key, null) : null;
+        threadId = Number(item.key.startsWith("thread:")
+          ? item.key.slice(7) : rec?.thread_id ?? item.id);
+        if (!Number.isSafeInteger(threadId) || threadId <= 1) {
+          job.skipped++;
+        } else {
+          // 在删除前标记，避免并发健康检查误清除用户验证/永久信任。
+          await env.TOPIC_MAP.put(`cleanup:deleted:${threadId}`, "1", { expirationTtl: 86400 });
+          const res = await tgCall(env, "deleteForumTopic", {
+            chat_id: env.SUPERGROUP_ID, message_thread_id: threadId,
+          }, 3000);
+          const missing = !res.ok && (isTopicMissingOrDeleted(res.description) ||
+            normalizeTgDescription(res.description).includes("topic_id_invalid"));
+          if (!res.ok && !missing) throw new Error(res.description || "删除话题失败");
+          if (rec) {
+            const current = await safeGetJSON(env, item.key, null);
+            if (Number(current?.thread_id) === threadId) await env.TOPIC_MAP.delete(item.key);
+          }
+          await env.TOPIC_MAP.delete(`thread:${threadId}`);
+          threadHealthCache.delete(threadId);
+          threadHealthCache.delete(String(threadId));
+          if (missing) job.missing++;
+          else job.deleted++;
+          Logger.info("cleanupall_topic_deleted", { threadId, missing });
+        }
+      } catch (e) {
+        job.errors++;
+        Logger.error("cleanupall_topic_failed", e, { threadId });
+      }
+      job.pending.shift();
+      await save(job);
+    }
+    const summary = `已删除: ${job.deleted}\n已不存在: ${job.missing}\n失败: ${job.errors}\n跳过 General / 无效记录: ${job.skipped}`;
+    if (job.phase === "done" && !job.pending.length) {
+      await env.TOPIC_MAP.delete(jobKey);
+      await notify(`${job.errors ? "⚠️ 强制清理结束，部分失败" : "✅ 强制清理完成"}\n\n${summary}\n\n` +
+        "General、用户验证/信任及封禁状态保持不变。失败记录保留，可重新发起 /cleanupall 重试。");
+    } else {
+      await notify(`⏸️ 本批清理已完成，进度已保存。\n${summary}\n\n请由原管理员发送以下命令继续：\n/cleanupall continue ${job.token}`);
+    }
+  } catch (e) {
+    Logger.error("cleanupall_failed", e);
+    await notify(`❌ 本批清理中断，进度已保存。稍后由原管理员继续：\n/cleanupall continue ${token}`);
+  } finally {
+    await releaseCleanupLock(env);
+  }
+}
+
 /**
  * 【修复 #8】批量清理命令处理函数（优化并发性能）
  *
@@ -2146,8 +2355,7 @@ function filterMessage(msg) {
  * @param {object} env - 环境变量对象
  */
 async function handleCleanupCommand(threadId, env) {
-  const lockKey = "cleanup:lock";
-  const locked = await env.TOPIC_MAP.get(lockKey);
+  const locked = !(await acquireCleanupLock(env));
   if (locked) {
     await tgCall(
       env,
@@ -2164,23 +2372,6 @@ async function handleCleanupCommand(threadId, env) {
     return;
   }
 
-  await env.TOPIC_MAP.put(lockKey, "1", {
-    expirationTtl: CONFIG.CLEANUP_LOCK_TTL_SECONDS,
-  });
-
-  // 发送处理中的消息
-  await tgCall(
-    env,
-    "sendMessage",
-    withMessageThreadId(
-      {
-        chat_id: env.SUPERGROUP_ID,
-        text: "🔄 **正在扫描需要清理的用户...**",
-        parse_mode: "Markdown",
-      },
-      threadId,
-    ),
-  );
 
   let cleanedCount = 0;
   let errorCount = 0;
@@ -2188,6 +2379,10 @@ async function handleCleanupCommand(threadId, env) {
   let scannedCount = 0;
 
   try {
+    await tgCall(env, "sendMessage", withMessageThreadId({
+      chat_id: env.SUPERGROUP_ID,
+      text: "🔄 正在扫描需要清理的用户...",
+    }, threadId));
     // 逐页扫描，避免一次性拉取全部 keys 导致超时/内存膨胀
     let cursor = undefined;
     do {
@@ -2217,7 +2412,9 @@ async function handleCleanupCommand(threadId, env) {
             // cleanup 要求更保守：仅在明确缺失/重定向时清理，避免误删有效记录
             if (probe.status === "redirected" || probe.status === "missing") {
               await env.TOPIC_MAP.delete(name);
-              await env.TOPIC_MAP.delete(`verified:${userId}`);
+              if (!(await env.TOPIC_MAP.get(`cleanup:deleted:${topicThreadId}`))) {
+                await env.TOPIC_MAP.delete(`verified:${userId}`);
+              }
               await env.TOPIC_MAP.delete(`thread:${topicThreadId}`);
 
               return {
@@ -2330,7 +2527,7 @@ async function handleCleanupCommand(threadId, env) {
       ),
     );
   } finally {
-    await env.TOPIC_MAP.delete(lockKey);
+    await releaseCleanupLock(env);
   }
 }
 
