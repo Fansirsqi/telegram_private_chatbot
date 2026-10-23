@@ -7,15 +7,19 @@ compatibility_date = "2024-11-30"
 # 不在这里声明的绑定会被删除。因此 KV 绑定必须写在下面，而不是只在后台配置。
 keep_vars = true
 
+# Turnstile sitekey 可公开；TURNSTILE_SECRET 仅在 Cloudflare 后台设为 Secret。
+[vars]
+TURNSTILE_SITEKEY = "0x4AAAAAAFgoLwYlqgYaItDo"
+
 # KV 绑定：请把 id 替换为你自己的 KV 命名空间 ID
 # （后台 Storage & Databases -> KV -> 点进 TOPIC_MAP 命名空间 -> 复制 ID）
 [[kv_namespaces]]
 binding = "TOPIC_MAP"
-id = "5fa2dd14a6414d428ad8ab30309f678b"
+id = "36a113b70a3041ef810b6bec9d405d2f"
 
 # 建议在 Cloudflare 后台 Worker Settings -> Variables 中配置：
 #   必需：BOT_TOKEN、SUPERGROUP_ID（keep_vars = true 可保护这些变量不被部署清除）
-#   Turnstile 验证（可选）：TURNSTILE_SITEKEY、TURNSTILE_SECRET（设为 Secret）
+#   Turnstile 验证：TURNSTILE_SITEKEY 已在上方配置；TURNSTILE_SECRET 必须在后台设为 Secret
 #   自定义域名时：PUBLIC_BASE_URL（如 https://chat.example.com）
 #   Webhook 加密（可选）：WEBHOOK_SECRET（配合 setWebhook 的 secret_token 参数）
 
